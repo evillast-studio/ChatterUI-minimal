@@ -56,8 +56,7 @@ export const estimateContextTokens = async (messages: any[]): Promise<number> =>
             // Solo tokenizar si no hay cache y hay contenido
             tokenizationNeeded++
             try {
-                const count = await Tokenizer.useTokenizer.getState().tokenize(swipe.swipe)
-                const tokenCount = count?.length ?? Math.ceil(swipe.swipe.length / 4) // fallback
+                const tokenCount = await Tokenizer.getTokenizer()(swipe.swipe)
                 totalTokens += tokenCount
                 swipe.token_count = tokenCount // Cache para futuras estimaciones
             } catch (e) {
@@ -218,4 +217,5 @@ export const useMemoryPruning = () => {
         stats,
         resetStats: () => setStats({ totalPruned: 0, totalMessages: 0, lastPruneReason: '' }),
     }
-}
+                   }
+                                         
