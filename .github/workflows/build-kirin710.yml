@@ -1,0 +1,62 @@
+name: Build APK (Kirin 710, desde fuente)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'ndk;27.2.12479018'
+
+      - run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache /usr/local/share/boost /root/.m2
+          sudo docker system prune -af 2>/dev/null || true
+
+      - run: |
+          sudo swapoff -a
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+
+      - run: npm install --no-audit --no-fund
+      - run: npx expo prebuild --platform android --no-install --clean
+        env:
+          EXPO_NO_TELEMETRY: 1
+
+      - run: |
+          DEST="node_modules/llama.rn/android/src/main/jniLibs/arm64-v8a"
+          mkdir -p "$DEST"
+          cp libs/arm64-v8a/librnllama.so "$DEST/"
+          cp libs/arm64-v8a/librnllama_v8.so "$DEST/"
+
+      - working-directory: android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a \
+            -Dorg.gradle.jvmargs="-Xmx12g -XX:MaxMetaspaceSize=512m" \
+            -Dorg.gradle.daemon=false \
+            -Pandroid.enableR8.fullMode=false \
+            -Pandroid.skipVerifyVersionRanges=true \
+            -x lint -x test --build-cache --parallel
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ChatterUI-${{ github.run_number }}
+          path: android/app/build/outputs/apk/release/*.apk
