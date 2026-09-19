@@ -24,6 +24,12 @@ jobs:
         with:
           packages: 'ndk;27.2.12479018'
 
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ndk-kirin710-llamarn-${{ runner.os }}
+          max-size: 2G
+
       - run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /root/.m2
           sudo rm -rf /opt/hostedtoolcache/CodeQL
@@ -61,3 +67,4 @@ jobs:
         with:
           name: ChatterUI-${{ github.run_number }}
           path: android/app/build/outputs/apk/release/*.apk
+          
