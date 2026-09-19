@@ -117,7 +117,7 @@ const defaultConfig: LlamaConfig = {
     threads: 4,
     gpu_layers: 0,
     batch: 512,
-    ctx_shift: true,
+    ctx_shift: false,
     devices: [],
     // Memory
     use_mmap: true,
@@ -180,10 +180,10 @@ export namespace Llama {
                     lastMmproj: state.lastMmproj,
                 }),
                 storage: createMMKVStorage(),
-                version: 6,
+                version: 7,
                 migrate: (persistedState: any, version) => {
                     if (version === 1) {
-                        persistedState.config.ctx_shift = true
+                        persistedState.config.ctx_shift = false
                         Logger.info('Migrated to v2 EngineData')
                     }
                     if (version === 2) {
@@ -218,6 +218,12 @@ export namespace Llama {
                         persistedState.config.n_keep = 256
                         persistedState.config.defrag_thold = 0.1
                         Logger.info('Migrated to v6 EngineData')
+                    }
+                    if (version === 6) {
+                        // Desactivar ctx_shift: preferimos memory pruning (rápido)
+                        // en vez de context shift nativo (lento en Kirin 710)
+                        persistedState.config.ctx_shift = false
+                        Logger.info('Migrated to v7 EngineData: ctx_shift disabled')
                     }
                     return persistedState
                 },
