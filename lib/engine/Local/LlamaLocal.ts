@@ -140,7 +140,7 @@ const defaultConfig: LlamaConfig = {
     rope_freq_scale: 0,
     // Context shift
     n_keep: 256,
-    defrag_thold: 0.1,
+    defrag_thold: 0.4,
     // Force backend
     force_device: false,
     custom_device: '',
@@ -223,6 +223,8 @@ export namespace Llama {
                         // Desactivar ctx_shift: preferimos memory pruning (rápido)
                         // en vez de context shift nativo (lento en Kirin 710)
                         persistedState.config.ctx_shift = false
+                        // Reducir frecuencia de defrag del KV cache (era muy agresivo)
+                        persistedState.config.defrag_thold = 0.4
                         Logger.info('Migrated to v7 EngineData: ctx_shift disabled')
                     }
                     return persistedState
@@ -541,7 +543,7 @@ export namespace Llama {
                 flash_attn: 'off',
                 disable_log: true,
                 n_keep: 256,
-                defrag_thold: 0.1,
+                defrag_thold: 0.4,
                 gpu_layers: 0,
             },
         },
@@ -559,7 +561,7 @@ export namespace Llama {
                 flash_attn: 'auto',
                 ubatch: 128,
                 n_keep: 256,
-                defrag_thold: 0.1,
+                defrag_thold: 0.4,
             },
         },
         {
@@ -576,7 +578,7 @@ export namespace Llama {
                 flash_attn: 'off',
                 ubatch: 256,
                 n_keep: 512,
-                defrag_thold: 0.1,
+                defrag_thold: 0.4,
             },
         },
         {
@@ -596,7 +598,7 @@ export namespace Llama {
                 flash_attn: 'off',
                 disable_log: true,
                 n_keep: 256,
-                defrag_thold: 0.1,
+                defrag_thold: 0.4,
             },
         },
     ]
@@ -624,7 +626,7 @@ export namespace Llama {
                 deleteUserPreset: (id: string) => {
                     set({ userPresets: get().userPresets.filter((p) => p.id !== id) })
                 },
-                getAllPresets: () => [...BUILTIN_PRESETS, ...get().userPresets],
+                getAllPresets: () => [...get().userPresets],
             }),
             {
                 name: Storage.EnginePresets,
@@ -651,4 +653,5 @@ export namespace Llama {
                 : '\nNo Tokens Generated')
         )
     }
-}
+            }
+                
