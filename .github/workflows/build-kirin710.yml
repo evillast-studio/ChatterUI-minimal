@@ -25,7 +25,8 @@ jobs:
           packages: 'ndk;27.2.12479018'
 
       - run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache /usr/local/share/boost /root/.m2
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /root/.m2
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
           sudo docker system prune -af 2>/dev/null || true
 
       - run: |
