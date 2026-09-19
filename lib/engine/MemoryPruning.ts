@@ -116,7 +116,8 @@ export const pruneMemoryIfNeeded = async (
     config: any,
     pruneConfig: MemoryPruneConfig = DEFAULT_PRUNE_CONFIG
 ): Promise<{ pruned: boolean; count: number; reason: string; contextShiftNeeded: boolean }> => {
-    if (messages.length <= pruneConfig.maxMessagesToKeep) {
+    // Solo saltar si prácticamente no hay conversación (evita vaciar el chat)
+    if (messages.length <= 2) {
         return { pruned: false, count: 0, reason: 'few_messages', contextShiftNeeded: false }
     }
 
@@ -129,10 +130,22 @@ export const pruneMemoryIfNeeded = async (
         return { pruned: false, count: 0, reason: 'under_soft_limit', contextShiftNeeded: false }
     }
 
+    // Piso absoluto: siempre dejar al menos estos mensajes (últimos = más relevantes)
+    const MIN_MESSAGES_FLOOR = 2
+
     // AMARILLO: soft limit - elimina 1-2 mensajes
     if (fillPercent >= pruneConfig.softLimitPercent && fillPercent < pruneConfig.hardLimitPercent) {
-        const toRemove = Math.min(2, messages.length - pruneConfig.maxMessagesToKeep)
-        
+        const toRemove = Math.max(0, Math.min(2, messages.length - MIN_MESSAGES_FLOOR))
+
+        if (toRemove === 0) {
+            if (pruneConfig.enableLogging) {
+                Logger.warn(
+                    `[Memory] 🟡 SOFT LIMIT: ${fillPercent.toFixed(0)}% lleno, pero no quedan mensajes de sobra para descartar.`
+                )
+            }
+            return { pruned: false, count: 0, reason: 'soft_limit_floor_reached', contextShiftNeeded: false }
+        }
+
         if (pruneConfig.enableLogging) {
             Logger.warn(
                 `[Memory] 🟡 SOFT LIMIT: ${fillPercent.toFixed(0)}% lleno. Descartando ${toRemove} mensaje(s) antiguo(s)...`
@@ -153,19 +166,29 @@ export const pruneMemoryIfNeeded = async (
 
     // ROJO: hard limit - elimina agresivamente + ctx_shift
     if (fillPercent >= pruneConfig.hardLimitPercent) {
-        const toRemove = Math.ceil(
-            (messages.length - pruneConfig.maxMessagesToKeep) * 
-            (pruneConfig.aggressiveFactorHard / 10)
+        const maxRemovable = Math.max(0, messages.length - MIN_MESSAGES_FLOOR)
+        const toRemove = Math.min(
+            maxRemovable,
+            Math.ceil(maxRemovable * (pruneConfig.aggressiveFactorHard / 10)) || maxRemovable
         )
-        
+
+        if (toRemove === 0) {
+            if (pruneConfig.enableLogging) {
+                Logger.error(
+                    `[Memory] 🔴 HARD LIMIT: ${fillPercent.toFixed(0)}% CRÍTICO, pero no quedan mensajes de sobra para descartar.`
+                )
+            }
+            return { pruned: false, count: 0, reason: 'hard_limit_floor_reached', contextShiftNeeded: false }
+        }
+
         if (pruneConfig.enableLogging) {
             Logger.error(
                 `[Memory] 🔴 HARD LIMIT: ${fillPercent.toFixed(0)}% CRÍTICO. ` +
-                `Descartando ${toRemove}/${messages.length} msgs. Forzando ctx_shift...`
+                `Descartando ${toRemove}/${messages.length} msgs.`
             )
         }
 
-        for (let i = 0; i < toRemove && messages.length > pruneConfig.maxMessagesToKeep; i++) {
+        for (let i = 0; i < toRemove; i++) {
             messages.shift()
         }
 
@@ -173,7 +196,7 @@ export const pruneMemoryIfNeeded = async (
             pruned: true,
             count: toRemove,
             reason: 'hard_limit_prune',
-            contextShiftNeeded: true, // ctx_shift=true para defrag de KV cache
+            contextShiftNeeded: false, // ctx_shift permanece desactivado; ya limpiamos memoria
         }
     }
 
@@ -217,5 +240,5 @@ export const useMemoryPruning = () => {
         stats,
         resetStats: () => setStats({ totalPruned: 0, totalMessages: 0, lastPruneReason: '' }),
     }
-                   }
-                                         
+        }
+            
