@@ -9,7 +9,7 @@ import { Characters } from '@lib/state/Characters'
 import { Chats, useInference } from '@lib/state/Chat'
 import { commonStopStrings, Instructs, outputPrefixes } from '@lib/state/Instructs'
 import { Logger } from '@lib/state/Logger'
-import { pruneMemoryIfNeeded, MemoryPruneConfig } from '@lib/engine/MemoryPruning'
+import { buildPruneConfig, pruneMemoryIfNeeded } from '@lib/engine/MemoryPruning'
 import { SamplersManager } from '@lib/state/SamplerState'
 import { mmkv } from '@lib/storage/MMKV'
 
@@ -18,6 +18,7 @@ import {
     buildChatCompletionContext,
     buildTextCompletionContext,
     ContextBuilderParams,
+    getSystemPrompt,
 } from './API/ContextBuilder'
 import { Llama, LlamaConfig } from './Local/LlamaLocal'
 import { KV } from './Local/Model'
@@ -84,16 +85,38 @@ const buildLocalPayload = async () => {
         return Logger.error('Failed to build fields')
     }
 
-    if (fields && fields.messages && fields.messages.length > 0) {
+    // Memory Pruning: activable desde Ajustes del modelo. Usa el presupuesto REAL del
+    // ContextBuilder (maxLength) y cuenta tambien el system prompt, para que 75% / 90%
+    // signifiquen lo mismo que lo que el builder considera "lleno".
+    if (localPreset.prune_enabled !== false && fields.messages.length > 0) {
+        let reserved = 0
+        try {
+            reserved = getSystemPrompt({
+                instruct: fields.instruct,
+                user: fields.user,
+                character: fields.character,
+                userCache: fields.cache.userCache,
+                characterCache: fields.cache.characterCache,
+                instructCache: fields.cache.instructCache,
+                usePrefix: false,
+                useSuffix: false,
+            }).systemPromptLength
+        } catch (e) {
+            Logger.warn(`[LocalInference] No se pudo medir el system prompt: ${e}`)
+        }
+
         const pruneResult = await pruneMemoryIfNeeded(
             fields.messages,
-            localPreset
+            localPreset,
+            buildPruneConfig(localPreset),
+            fields.maxLength,
+            reserved
         )
-        
+
         if (pruneResult.pruned) {
-            Logger.log(
+            Logger.info(
                 `[LocalInference] Memory Pruning: ${pruneResult.count} msgs eliminados ` +
-                `(${pruneResult.reason}). Mensajes restantes: ${fields.messages.length}`
+                    `(${pruneResult.reason}). Mensajes restantes: ${fields.messages.length}`
             )
         }
     }
@@ -503,13 +526,15 @@ const obtainFields = async (): Promise<ContextBuilderParams | void> => {
                 if (entry.id === -1) return 0
                 const [activeSwipe] = entry.swipes.filter((item) => item.active)
                 if (!activeSwipe) return 0
-                const tokenCount = activeSwipe.token_count ?? 0
+                // token_length = valor guardado en DB; token_count = cache en memoria
+                let tokenCount = activeSwipe.token_length ?? activeSwipe.token_count ?? 0
                 if (tokenCount === 0 && activeSwipe.swipe.length > 0) {
                     // assume that token length hasnt been calculated
-                    const tokenCount = await Llama.useLlamaModelStore.getState().tokenLength(
+                    tokenCount = await Llama.useLlamaModelStore.getState().tokenLength(
                         activeSwipe.swipe,
                         entry.attachments.map((item) => item.uri)
                     )
+                    activeSwipe.token_count = tokenCount // cache en memoria para la poda
                     Chats.db.mutate.updateSwipeTokenLength(activeSwipe.id, tokenCount)
                 }
 
