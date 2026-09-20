@@ -15,7 +15,6 @@ import React from 'react'
 
 import { Tokenizer } from './Tokenizer'
 import { Llama } from './Local/LlamaLocal'
-import { Chats } from '@lib/state/Chat'
 import { Logger } from '@lib/state/Logger'
 
 export type MemoryPruneConfig = {
@@ -36,22 +35,45 @@ export const DEFAULT_PRUNE_CONFIG: MemoryPruneConfig = {
 }
 
 /**
+ * Construye la config de poda a partir de los ajustes del usuario (LlamaConfig).
+ * Valida rangos: 30 <= soft < hard <= 98, para que nunca queden invertidos ni absurdos.
+ */
+export const buildPruneConfig = (config: any): MemoryPruneConfig => {
+    let soft = Number(config?.prune_soft_percent ?? DEFAULT_PRUNE_CONFIG.softLimitPercent)
+    let hard = Number(config?.prune_hard_percent ?? DEFAULT_PRUNE_CONFIG.hardLimitPercent)
+    if (!Number.isFinite(soft)) soft = DEFAULT_PRUNE_CONFIG.softLimitPercent
+    if (!Number.isFinite(hard)) hard = DEFAULT_PRUNE_CONFIG.hardLimitPercent
+    soft = Math.min(Math.max(soft, 30), 95)
+    hard = Math.min(Math.max(hard, soft + 3), 98)
+    return { ...DEFAULT_PRUNE_CONFIG, softLimitPercent: soft, hardLimitPercent: hard }
+}
+
+/**
  * Estima cuántos tokens ocupa el contexto actual (con caching para speed)
  * Usa token_count cacheado primero, tokeniza bajo demanda si falta.
  */
+/**
+ * Devuelve la swipe activa de una entrada.
+ * OJO: entry.swipe_id esta DEPRECADO (ver migration.deprecate_swipe_id);
+ * la swipe activa se marca con swipe.active === true.
+ */
+const getActiveSwipe = (entry: any) => {
+    if (!entry || !Array.isArray(entry.swipes) || entry.swipes.length === 0) return undefined
+    return entry.swipes.find((s: any) => s?.active) ?? entry.swipes[entry.swipes.length - 1]
+}
+
 export const estimateContextTokens = async (messages: any[]): Promise<number> => {
     let totalTokens = 0
     let tokenizationNeeded = 0
 
     for (const entry of messages) {
-        if (!entry || !entry.swipes) continue
-        
-        const swipe = entry.swipes[entry.swipe_id]
+        const swipe = getActiveSwipe(entry)
         if (!swipe || !swipe.swipe) continue
 
-        // Usar token_count cacheado (primera opción)
-        if (swipe.token_count && swipe.token_count > 0) {
-            totalTokens += swipe.token_count
+        // Cache: token_length (DB) o token_count (estado en memoria)
+        const cached = swipe.token_length ?? swipe.token_count
+        if (typeof cached === 'number' && cached > 0) {
+            totalTokens += cached
         } else if (swipe.swipe.length > 0) {
             // Solo tokenizar si no hay cache y hay contenido
             tokenizationNeeded++
@@ -67,7 +89,7 @@ export const estimateContextTokens = async (messages: any[]): Promise<number> =>
     }
 
     if (tokenizationNeeded > 0) {
-        Logger.log(`[Memory] Tokenized ${tokenizationNeeded} messages for estimation`)
+        Logger.info(`[Memory] Tokenized ${tokenizationNeeded} messages for estimation`)
     }
 
     return totalTokens
@@ -101,6 +123,26 @@ export const getAvailableTokens = (config: any, genamt?: number): number => {
 }
 
 /**
+ * Elimina los mensajes mas antiguos (desde el inicio del arreglo).
+ * Despues de podar, si el primer mensaje queda siendo del asistente, tambien se
+ * elimina (siempre que se respete el piso), para que la conversacion empiece con
+ * un turno del usuario y las plantillas de chat no fallen.
+ * Devuelve cuantos mensajes se eliminaron en total.
+ */
+const removeOldest = (messages: any[], count: number, floor: number): number => {
+    let removed = 0
+    for (let i = 0; i < count && messages.length > floor; i++) {
+        messages.shift()
+        removed++
+    }
+    while (messages.length > floor && messages[0] && messages[0].is_user === false) {
+        messages.shift()
+        removed++
+    }
+    return removed
+}
+
+/**
  * Prune inteligente: elimina mensajes antiguos cuando se llenan.
  * 
  * NIVELES:
@@ -114,15 +156,18 @@ export const getAvailableTokens = (config: any, genamt?: number): number => {
 export const pruneMemoryIfNeeded = async (
     messages: any[],
     config: any,
-    pruneConfig: MemoryPruneConfig = DEFAULT_PRUNE_CONFIG
+    pruneConfig: MemoryPruneConfig = DEFAULT_PRUNE_CONFIG,
+    tokenBudget?: number, // maxLength real del ContextBuilder; si falta se estima
+    reservedTokens: number = 0 // tokens fijos (system prompt + tarjeta) que ocupan contexto y no se podan
 ): Promise<{ pruned: boolean; count: number; reason: string; contextShiftNeeded: boolean }> => {
     // Solo saltar si prácticamente no hay conversación (evita vaciar el chat)
     if (messages.length <= 2) {
         return { pruned: false, count: 0, reason: 'few_messages', contextShiftNeeded: false }
     }
 
-    const currentTokens = await estimateContextTokens(messages)
-    const availableTokens = getAvailableTokens(config, config.n_predict)
+    const currentTokens = (await estimateContextTokens(messages)) + Math.max(reservedTokens, 0)
+    const availableTokens =
+        tokenBudget && tokenBudget > 0 ? tokenBudget : getAvailableTokens(config, config.n_predict)
     const fillPercent = (currentTokens / availableTokens) * 100
 
     // VERDE: sin prune necesario
@@ -152,13 +197,11 @@ export const pruneMemoryIfNeeded = async (
             )
         }
 
-        for (let i = 0; i < toRemove; i++) {
-            messages.shift()
-        }
+        const removed = removeOldest(messages, toRemove, MIN_MESSAGES_FLOOR)
 
         return {
-            pruned: true,
-            count: toRemove,
+            pruned: removed > 0,
+            count: removed,
             reason: 'soft_limit_prune',
             contextShiftNeeded: false, // ctx_shift=false, solo descarte
         }
@@ -188,13 +231,11 @@ export const pruneMemoryIfNeeded = async (
             )
         }
 
-        for (let i = 0; i < toRemove; i++) {
-            messages.shift()
-        }
+        const removed = removeOldest(messages, toRemove, MIN_MESSAGES_FLOOR)
 
         return {
-            pruned: true,
-            count: toRemove,
+            pruned: removed > 0,
+            count: removed,
             reason: 'hard_limit_prune',
             contextShiftNeeded: false, // ctx_shift permanece desactivado; ya limpiamos memoria
         }
@@ -240,5 +281,4 @@ export const useMemoryPruning = () => {
         stats,
         resetStats: () => setStats({ totalPruned: 0, totalMessages: 0, lastPruneReason: '' }),
     }
-        }
-            
+}
