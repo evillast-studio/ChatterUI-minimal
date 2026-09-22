@@ -1,143 +1,143 @@
-/**
- * kirin710.plugin.js
- * 
- * Expo config plugin que parchea el CMakeLists.txt de cui-llama.rn
- * durante el prebuild para compilar el .so optimizado para Cortex-A73.
- * 
- * Cortex-A73 (Kirin 710) specs relevantes:
- *   - ARMv8-A (SIN dotprod — eso es ARMv8.2-A → SIGILL en A73)
- *   - NEON 128-bit SIMD: SÍ
- *   - FP16 hardware: NO
- *   - L1 D-cache: 32KB, L2: 256KB/core, L3 shared: 1MB
- *   - Pipeline: 11 etapas, 2-wide decode, OoO
- */
+name: Build APK (Kirin 710, desde fuente)
 
-const { withDangerousMod } = require('expo/config-plugins')
-const fs = require('fs')
-const path = require('path')
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
 
-const MARKER = '# __KIRIN710_INJECTED__'
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
 
-const K710_CMAKE_BLOCK = `
-${MARKER}
-# ── Kirin 710 / Cortex-A73 native optimization ─────────────────────────────
-# Aplicado por expo-build-plugins/kirin710.plugin.js
-# Cortex-A73 es ARMv8-A puro. NO soporta dotprod (ARMv8.2-A).
-# Activar dotprod causa SIGILL (illegal instruction) en runtime.
-if(ANDROID AND ANDROID_ABI STREQUAL "arm64-v8a")
-    message(STATUS "")
-    message(STATUS "===================================================")
-    message(STATUS " Kirin 710 / Cortex-A73 optimization ACTIVE")
-    message(STATUS " ABI: arm64-v8a | march: armv8-a | tune: cortex-a73")
-    message(STATUS "===================================================")
-    message(STATUS "")
+    steps:
+      - uses: actions/checkout@v4
 
-    set(K710_C_FLAGS
-        -march=armv8-a          # ARMv8-A base — seguro en A73
-        -mtune=cortex-a73       # Scheduling optimizado para pipeline A73
-        -O3                     # Máxima optimización
-        -ffast-math             # Relajar precisión IEEE para más velocidad
-        -fno-math-errno         # No setear errno en funciones math
-        -funroll-loops          # Desenrollar loops (beneficia NEON)
-        -fvectorize             # Vectorización automática (NEON)
-        -fomit-frame-pointer    # Liberar registro extra
-        -fno-stack-protector    # Quitar stack canary (release only)
-    )
-    string(JOIN " " K710_FLAGS_STR \${K710_C_FLAGS})
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
 
-    # Aplicar a C y C++ — FORCE para sobreescribir cualquier flag previo
-    set(CMAKE_C_FLAGS   "\${CMAKE_C_FLAGS} \${K710_FLAGS_STR}"   CACHE STRING "" FORCE)
-    set(CMAKE_CXX_FLAGS "\${CMAKE_CXX_FLAGS} \${K710_FLAGS_STR}" CACHE STRING "" FORCE)
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
 
-    # ── Deshabilitar dotprod EXPLÍCITAMENTE ────────────────────────────────
-    # El compilador NDK *soporta* el flag aunque el target no lo tenga.
-    # GGML puede habilitarlo si no lo forzamos OFF. Resultado: SIGILL en A73.
-    set(GGML_DOTPROD        OFF CACHE BOOL "A73 no tiene dotprod" FORCE)
-    set(GGML_ARM_DOTPROD    OFF CACHE BOOL "" FORCE)
-    # Variantes según versión de llama.cpp
-    set(GGML_USE_LLAMAFILE  OFF CACHE BOOL "" FORCE)
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'ndk;27.2.12479018'
 
-    # ── Habilitar NEON explícitamente ──────────────────────────────────────
-    # A73 tiene NEON 128-bit. GGML lo detecta en aarch64 pero es mejor forzarlo.
-    set(GGML_NEON ON CACHE BOOL "A73 tiene NEON" FORCE)
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ndk-kirin710-llamarn-${{ runner.os }}
+          max-size: 2G
 
-    # ── Deshabilitar backends no disponibles en Kirin 710 ──────────────────
-    set(GGML_METAL  OFF CACHE BOOL "" FORCE)  # Solo iOS
-    set(GGML_CUDA   OFF CACHE BOOL "" FORCE)  # No hay CUDA
-    # Vulkan: Kirin 710 / Mali-G51 MP4 NO tiene Vulkan Compute funcional para GGML.
-    # Deshabilitarlo en compile-time elimina el warning "ggml_vk_create_instance:
-    # No Vulkan devices found" que aparece en cada arranque aunque disable_log=true.
-    set(GGML_VULKAN OFF CACHE BOOL "Kirin 710 no tiene Vulkan Compute" FORCE)
-    set(GGML_VULKAN_DEBUG OFF CACHE BOOL "" FORCE)
-    set(GGML_VULKAN_MEMORY_DEBUG OFF CACHE BOOL "" FORCE)
-    # OpenCL: dejar en runtime vía force_device (el .so genérico ya lo incluye)
-endif()
-# ── Fin Kirin 710 ───────────────────────────────────────────────────────────
-`
+      - name: Liberar espacio en disco
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /root/.m2
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker system prune -af 2>/dev/null || true
 
-function patchCMakeLists(projectRoot) {
-    // Buscar CMakeLists en cui-llama.rn
-    const candidates = [
-        // cui-llama.rn >= 1.12: CMakeLists está en android/rnllama/CMakeLists.txt
-        path.join(projectRoot, 'node_modules', 'cui-llama.rn', 'android', 'rnllama', 'CMakeLists.txt'),
-        // llama.rn también puede tenerlo en rnllama/
-        path.join(projectRoot, 'node_modules', 'llama.rn', 'android', 'rnllama', 'CMakeLists.txt'),
-        // Fallback: raíz de android/ (versiones antiguas)
-        path.join(projectRoot, 'node_modules', 'cui-llama.rn', 'android', 'CMakeLists.txt'),
-        path.join(projectRoot, 'node_modules', 'llama.rn', 'android', 'CMakeLists.txt'),
-    ]
+      - name: Crear swapfile 8GB
+        run: |
+          sudo swapoff -a
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
 
-    const cmakePath = candidates.find(fs.existsSync)
+      - name: Instalar dependencias npm
+        run: npm install --no-audit --no-fund
 
-    if (!cmakePath) {
-        return false
-    }
+      - name: Verificar que aibot.raw existe
+        run: |
+          if [ ! -f "assets/models/aibot.raw" ]; then
+            echo "ERROR: assets/models/aibot.raw no encontrado"
+            echo "Este archivo debe estar en el repo (no en .gitignore)"
+            exit 1
+          fi
+          echo "✓ aibot.raw: $(wc -c < assets/models/aibot.raw) bytes"
+          if [ ! -f "assets/aibot.png" ] || [ "$(wc -c < assets/aibot.png)" -lt 1000 ]; then
+            echo "ADVERTENCIA: assets/aibot.png es un placeholder (normal si usas git-lfs o .raw)"
+          fi
 
-    let content = fs.readFileSync(cmakePath, 'utf8')
+      - name: Expo prebuild
+        run: npx expo prebuild --platform android --no-install --clean
+        env:
+          EXPO_NO_TELEMETRY: 1
 
-    // Idempotente: no aplicar dos veces
-    if (content.includes(MARKER)) {
-        return true
-    }
+      - name: Copiar .so precompilados a cui-llama.rn
+        run: |
+          # El módulo es cui-llama.rn, NO llama.rn
+          DEST="node_modules/cui-llama.rn/android/src/main/jniLibs/arm64-v8a"
+          mkdir -p "$DEST"
+          cp libs/arm64-v8a/librnllama.so    "$DEST/"
+          cp libs/arm64-v8a/librnllama_v8.so "$DEST/"
+          echo "✓ .so copiados a $DEST"
+          ls -lh "$DEST"
 
-    // Insertar después de project() o cmake_minimum_required()
-    // Necesita estar temprano para que las variables CACHE funcionen
-    const insertionPatterns = [
-        /project\s*\([^)]+\)\s*/,
-        /cmake_minimum_required\s*\([^)]+\)\s*/,
-    ]
+      - name: Verificar parche Kirin 710 en CMakeLists
+        run: |
+          # Buscar CMakeLists en las ubicaciones conocidas de cui-llama.rn
+          CMAKE_FILE=""
+          for candidate in \
+            "node_modules/cui-llama.rn/android/rnllama/CMakeLists.txt" \
+            "node_modules/cui-llama.rn/android/CMakeLists.txt"; do
+            if [ -f "$candidate" ]; then
+              CMAKE_FILE="$candidate"
+              break
+            fi
+          done
 
-    let inserted = false
-    for (const pattern of insertionPatterns) {
-        const match = content.match(pattern)
-        if (match) {
-            content = content.replace(match[0], match[0] + K710_CMAKE_BLOCK)
-            inserted = true
-            break
-        }
-    }
+          if [ -z "$CMAKE_FILE" ]; then
+            echo "ERROR: CMakeLists.txt de cui-llama.rn no encontrado"
+            exit 1
+          fi
 
-    if (!inserted) {
-        // Fallback: insertar al principio
-        content = K710_CMAKE_BLOCK + '\n' + content
-    }
+          if grep -q "__KIRIN710_INJECTED__" "$CMAKE_FILE"; then
+            echo "✓ Parche Kirin 710 aplicado en $CMAKE_FILE"
+            grep -A2 "march=armv8-a" "$CMAKE_FILE" | head -5
+          else
+            echo "ERROR: El parche Kirin 710 NO se aplicó"
+            echo "  Verificar que kirin710.plugin.js está en expo-build-plugins/"
+            echo "  y referenciado en app.config.js"
+            exit 1
+          fi
 
-    fs.writeFileSync(cmakePath, content)
-    return true
-}
+      - name: Build APK release
+        working-directory: android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease \
+            -PreactNativeArchitectures=arm64-v8a \
+            -Dorg.gradle.jvmargs="-Xmx12g -XX:MaxMetaspaceSize=512m" \
+            -Dorg.gradle.daemon=false \
+            -Pandroid.enableR8.fullMode=false \
+            -Pandroid.skipVerifyVersionRanges=true \
+            -x lint -x test \
+            --build-cache --parallel
 
-module.exports = function withKirin710(config, options = {}) {
-    const { enabled = true } = options
+      - name: Verificar APK generado
+        run: |
+          APK=$(find android/app/build/outputs/apk/release -name "*.apk" | head -1)
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK no generado"
+            exit 1
+          fi
+          SIZE=$(du -sh "$APK" | cut -f1)
+          echo "✓ APK: $APK ($SIZE)"
 
-    if (!enabled) {
-        return config
-    }
+          # Verificar que aibot.raw quedó empaquetado en el APK
+          if unzip -l "$APK" | grep -q "aibot"; then
+            echo "✓ aibot.raw empaquetado en el APK"
+          else
+            echo "ADVERTENCIA: aibot.raw no encontrado dentro del APK"
+            echo "  El personaje por defecto no cargará en el primer arranque"
+          fi
 
-    return withDangerousMod(config, [
-        'android',
-        async (c) => {
-            patchCMakeLists(c.modRequest.projectRoot)
-            return c
-        },
-    ])
-}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ChatterUI-Kirin710-${{ github.run_number }}
+          path: android/app/build/outputs/apk/release/*.apk
+    
