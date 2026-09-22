@@ -13,13 +13,16 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
+
       - uses: android-actions/setup-android@v3
         with:
           packages: 'ndk;27.2.12479018'
@@ -30,41 +33,111 @@ jobs:
           key: ndk-kirin710-llamarn-${{ runner.os }}
           max-size: 2G
 
-      - run: |
+      - name: Liberar espacio en disco
+        run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /root/.m2
           sudo rm -rf /opt/hostedtoolcache/CodeQL
           sudo docker system prune -af 2>/dev/null || true
 
-      - run: |
+      - name: Crear swapfile 8GB
+        run: |
           sudo swapoff -a
           sudo fallocate -l 8G /swapfile
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
           sudo swapon /swapfile
 
-      - run: npm install --no-audit --no-fund
-      - run: npx expo prebuild --platform android --no-install --clean
+      - name: Instalar dependencias npm
+        run: npm install --no-audit --no-fund
+
+      - name: Verificar que aibot.raw existe
+        run: |
+          if [ ! -f "assets/models/aibot.raw" ]; then
+            echo "ERROR: assets/models/aibot.raw no encontrado"
+            echo "Este archivo debe estar en el repo (no en .gitignore)"
+            exit 1
+          fi
+          echo "✓ aibot.raw: $(wc -c < assets/models/aibot.raw) bytes"
+          if [ ! -f "assets/aibot.png" ] || [ "$(wc -c < assets/aibot.png)" -lt 1000 ]; then
+            echo "ADVERTENCIA: assets/aibot.png es un placeholder (normal si usas git-lfs o .raw)"
+          fi
+
+      - name: Expo prebuild
+        run: npx expo prebuild --platform android --no-install --clean
         env:
           EXPO_NO_TELEMETRY: 1
 
-      - run: |
-          DEST="node_modules/llama.rn/android/src/main/jniLibs/arm64-v8a"
+      - name: Copiar .so precompilados a cui-llama.rn
+        run: |
+          # El módulo es cui-llama.rn, NO llama.rn
+          DEST="node_modules/cui-llama.rn/android/src/main/jniLibs/arm64-v8a"
           mkdir -p "$DEST"
-          cp libs/arm64-v8a/librnllama.so "$DEST/"
+          cp libs/arm64-v8a/librnllama.so    "$DEST/"
           cp libs/arm64-v8a/librnllama_v8.so "$DEST/"
+          echo "✓ .so copiados a $DEST"
+          ls -lh "$DEST"
 
-      - working-directory: android
+      - name: Verificar parche Kirin 710 en CMakeLists
+        run: |
+          # Buscar CMakeLists en las ubicaciones conocidas de cui-llama.rn
+          CMAKE_FILE=""
+          for candidate in \
+            "node_modules/cui-llama.rn/android/rnllama/CMakeLists.txt" \
+            "node_modules/cui-llama.rn/android/CMakeLists.txt"; do
+            if [ -f "$candidate" ]; then
+              CMAKE_FILE="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$CMAKE_FILE" ]; then
+            echo "ERROR: CMakeLists.txt de cui-llama.rn no encontrado"
+            exit 1
+          fi
+
+          if grep -q "__KIRIN710_INJECTED__" "$CMAKE_FILE"; then
+            echo "✓ Parche Kirin 710 aplicado en $CMAKE_FILE"
+            grep -A2 "march=armv8-a" "$CMAKE_FILE" | head -5
+          else
+            echo "ERROR: El parche Kirin 710 NO se aplicó"
+            echo "  Verificar que kirin710.plugin.js está en expo-build-plugins/"
+            echo "  y referenciado en app.config.js"
+            exit 1
+          fi
+
+      - name: Build APK release
+        working-directory: android
         run: |
           chmod +x ./gradlew
-          ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a \
+          ./gradlew assembleRelease \
+            -PreactNativeArchitectures=arm64-v8a \
             -Dorg.gradle.jvmargs="-Xmx12g -XX:MaxMetaspaceSize=512m" \
             -Dorg.gradle.daemon=false \
             -Pandroid.enableR8.fullMode=false \
             -Pandroid.skipVerifyVersionRanges=true \
-            -x lint -x test --build-cache --parallel
+            -x lint -x test \
+            --build-cache --parallel
+
+      - name: Verificar APK generado
+        run: |
+          APK=$(find android/app/build/outputs/apk/release -name "*.apk" | head -1)
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK no generado"
+            exit 1
+          fi
+          SIZE=$(du -sh "$APK" | cut -f1)
+          echo "✓ APK: $APK ($SIZE)"
+
+          # Verificar que aibot.raw quedó empaquetado en el APK
+          if unzip -l "$APK" | grep -q "aibot"; then
+            echo "✓ aibot.raw empaquetado en el APK"
+          else
+            echo "ADVERTENCIA: aibot.raw no encontrado dentro del APK"
+            echo "  El personaje por defecto no cargará en el primer arranque"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ChatterUI-${{ github.run_number }}
+          name: ChatterUI-Kirin710-${{ github.run_number }}
           path: android/app/build/outputs/apk/release/*.apk
           
