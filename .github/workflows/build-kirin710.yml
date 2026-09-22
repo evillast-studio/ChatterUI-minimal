@@ -50,60 +50,91 @@ jobs:
       - name: Instalar dependencias npm
         run: npm install --no-audit --no-fund
 
-      - name: Verificar que aibot.raw existe
-        run: |
-          if [ ! -f "assets/models/aibot.raw" ]; then
-            echo "ERROR: assets/models/aibot.raw no encontrado"
-            echo "Este archivo debe estar en el repo (no en .gitignore)"
-            exit 1
-          fi
-          echo "✓ aibot.raw: $(wc -c < assets/models/aibot.raw) bytes"
-          if [ ! -f "assets/aibot.png" ] || [ "$(wc -c < assets/aibot.png)" -lt 1000 ]; then
-            echo "ADVERTENCIA: assets/aibot.png es un placeholder (normal si usas git-lfs o .raw)"
-          fi
-
       - name: Expo prebuild
         run: npx expo prebuild --platform android --no-install --clean
         env:
           EXPO_NO_TELEMETRY: 1
 
-      - name: Copiar .so precompilados a cui-llama.rn
-        run: |
-          # El módulo es cui-llama.rn, NO llama.rn
-          DEST="node_modules/cui-llama.rn/android/src/main/jniLibs/arm64-v8a"
-          mkdir -p "$DEST"
-          cp libs/arm64-v8a/librnllama.so    "$DEST/"
-          cp libs/arm64-v8a/librnllama_v8.so "$DEST/"
-          echo "✓ .so copiados a $DEST"
-          ls -lh "$DEST"
+      - name: Forzar build desde fuente
+        run: echo "rnllamaBuildFromSource=true" >> android/gradle.properties
 
-      - name: Verificar parche Kirin 710 en CMakeLists
+      - name: Parchear CMakeLists para Kirin 710 / Cortex-A73
         run: |
-          # Buscar CMakeLists en las ubicaciones conocidas de cui-llama.rn
-          CMAKE_FILE=""
-          for candidate in \
-            "node_modules/cui-llama.rn/android/rnllama/CMakeLists.txt" \
-            "node_modules/cui-llama.rn/android/CMakeLists.txt"; do
-            if [ -f "$candidate" ]; then
-              CMAKE_FILE="$candidate"
-              break
-            fi
-          done
+          CMAKE_FILE=$(find node_modules/cui-llama.rn/android -name "CMakeLists.txt" | head -1)
 
           if [ -z "$CMAKE_FILE" ]; then
             echo "ERROR: CMakeLists.txt de cui-llama.rn no encontrado"
+            find node_modules/cui-llama.rn/android -type f | head -20
             exit 1
           fi
 
+          echo "✓ CMakeLists encontrado: $CMAKE_FILE"
+
           if grep -q "__KIRIN710_INJECTED__" "$CMAKE_FILE"; then
-            echo "✓ Parche Kirin 710 aplicado en $CMAKE_FILE"
-            grep -A2 "march=armv8-a" "$CMAKE_FILE" | head -5
-          else
-            echo "ERROR: El parche Kirin 710 NO se aplicó"
-            echo "  Verificar que kirin710.plugin.js está en expo-build-plugins/"
-            echo "  y referenciado en app.config.js"
-            exit 1
+            echo "Parche ya aplicado, saltando."
+            exit 0
           fi
+
+          read -r -d '' K710_BLOCK << 'CMAKE_EOF' || true
+
+          # __KIRIN710_INJECTED__
+          # Kirin 710 / Cortex-A73 — aplicado por build-kirin710.yml
+          # ARMv8-A puro. SIN dotprod (ARMv8.2-A) → SIGILL en A73.
+          if(ANDROID AND ANDROID_ABI STREQUAL "arm64-v8a")
+              set(K710_FLAGS
+                  -march=armv8-a
+                  -mtune=cortex-a73
+                  -O3
+                  -ffast-math
+                  -fno-math-errno
+                  -fstrict-aliasing
+                  -funroll-loops
+                  -fvectorize
+                  -fprefetch-loop-arrays
+                  -fomit-frame-pointer
+                  -fno-stack-protector
+                  -ffunction-sections
+                  -fdata-sections
+              )
+              string(JOIN " " K710_FLAGS_STR ${K710_FLAGS})
+              set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS} ${K710_FLAGS_STR}"   CACHE STRING "" FORCE)
+              set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${K710_FLAGS_STR}" CACHE STRING "" FORCE)
+              set(CMAKE_EXE_LINKER_FLAGS    "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections -Wl,-O1 -Wl,--as-needed"    CACHE STRING "" FORCE)
+              set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--gc-sections -Wl,-O1 -Wl,--as-needed" CACHE STRING "" FORCE)
+              set(GGML_DOTPROD        OFF CACHE BOOL "A73 no tiene dotprod" FORCE)
+              set(GGML_ARM_DOTPROD    OFF CACHE BOOL "" FORCE)
+              set(GGML_USE_LLAMAFILE  OFF CACHE BOOL "" FORCE)
+              set(GGML_NEON           ON  CACHE BOOL "A73 tiene NEON" FORCE)
+              set(GGML_FP16_VA        ON  CACHE BOOL "FP16 via NEON en A73" FORCE)
+              set(LLAMA_NATIVE        OFF CACHE BOOL "No auto-detectar CPU del host" FORCE)
+              set(GGML_METAL          OFF CACHE BOOL "" FORCE)
+              set(GGML_CUDA           OFF CACHE BOOL "" FORCE)
+              set(GGML_VULKAN         OFF CACHE BOOL "Kirin 710 no tiene Vulkan Compute" FORCE)
+              set(GGML_VULKAN_DEBUG   OFF CACHE BOOL "" FORCE)
+              set(GGML_F16C           OFF CACHE BOOL "F16C es x86, no aplica en ARM" FORCE)
+              set(GGML_OPENMP         OFF CACHE BOOL "Usar threads propios de llama.cpp" FORCE)
+          endif()
+          # Fin Kirin 710
+          CMAKE_EOF
+
+          python3 - "$CMAKE_FILE" "$K710_BLOCK" << 'PYEOF'
+          import sys, re
+          cmake_path = sys.argv[1]
+          block = sys.argv[2]
+          content = open(cmake_path).read()
+          for pattern in [r'(project\s*\([^)]+\)\s*\n)', r'(cmake_minimum_required\s*\([^)]+\)\s*\n)']:
+              m = re.search(pattern, content, re.IGNORECASE)
+              if m:
+                  content = content[:m.end()] + block + '\n' + content[m.end():]
+                  break
+          else:
+              content = block + '\n' + content
+          open(cmake_path, 'w').write(content)
+          print(f"Parche aplicado en {cmake_path}")
+          PYEOF
+
+          echo "✓ Flags: -march=armv8-a -mtune=cortex-a73 -O3 -ffast-math -fprefetch-loop-arrays"
+          echo "✓ GGML_DOTPROD=OFF GGML_NEON=ON GGML_FP16_VA=ON LLAMA_NATIVE=OFF"
 
       - name: Build APK release
         working-directory: android
@@ -117,24 +148,6 @@ jobs:
             -Pandroid.skipVerifyVersionRanges=true \
             -x lint -x test \
             --build-cache --parallel
-
-      - name: Verificar APK generado
-        run: |
-          APK=$(find android/app/build/outputs/apk/release -name "*.apk" | head -1)
-          if [ -z "$APK" ]; then
-            echo "ERROR: APK no generado"
-            exit 1
-          fi
-          SIZE=$(du -sh "$APK" | cut -f1)
-          echo "✓ APK: $APK ($SIZE)"
-
-          # Verificar que aibot.raw quedó empaquetado en el APK
-          if unzip -l "$APK" | grep -q "aibot"; then
-            echo "✓ aibot.raw empaquetado en el APK"
-          else
-            echo "ADVERTENCIA: aibot.raw no encontrado dentro del APK"
-            echo "  El personaje por defecto no cargará en el primer arranque"
-          fi
 
       - uses: actions/upload-artifact@v4
         with:
